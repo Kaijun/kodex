@@ -1,0 +1,327 @@
+name: alias-release
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/kdx-release.yml"
+      - "alias/**"
+  workflow_dispatch:
+    inputs:
+      upstream_tag:
+        description: Optional stable upstream tag, for example rust-v0.144.5
+        required: false
+        type: string
+  schedule:
+    - cron: "17 * * * *"
+
+concurrency:
+  group: alias-release
+  cancel-in-progress: false
+
+permissions:
+  actions: write
+  contents: write
+
+jobs:
+  detect:
+    runs-on: ubuntu-latest
+    outputs:
+      binary_name: ${{ steps.alias.outputs.binary_name }}
+      display_name: ${{ steps.alias.outputs.display_name }}
+      env_prefix: ${{ steps.alias.outputs.env_prefix }}
+      release_tag: ${{ steps.release.outputs.release_tag }}
+      should_build: ${{ steps.release.outputs.should_build }}
+      upstream_tag: ${{ steps.release.outputs.upstream_tag }}
+    steps:
+      - name: Check out alias overlay
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Disable unrelated fork workflows
+        if: github.repository == 'Kaijun/kodex'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          current_workflow=".github/workflows/kdx-release.yml"
+          gh api --paginate \
+            "repos/${GITHUB_REPOSITORY}/actions/workflows?per_page=100" \
+            --jq '.workflows[] | select(.state == "active") | [.id, .path] | @tsv' |
+            while IFS=$'\t' read -r workflow_id workflow_path; do
+              if [[ "$workflow_path" != "$current_workflow" ]]; then
+                echo "Disabling $workflow_path"
+                gh api --method PUT \
+                  "repos/${GITHUB_REPOSITORY}/actions/workflows/${workflow_id}/disable" ||
+                  echo "::warning::Could not disable $workflow_path"
+              fi
+            done
+
+          gh api --paginate \
+            "repos/${GITHUB_REPOSITORY}/actions/runs?status=in_progress&per_page=100" \
+            --jq '.workflow_runs[] | [.id, .head_sha, .path] | @tsv' |
+            while IFS=$'\t' read -r run_id head_sha workflow_path; do
+              if [[ "$run_id" != "$GITHUB_RUN_ID" && "$head_sha" == "$GITHUB_SHA" ]]; then
+                echo "Cancelling $workflow_path run $run_id"
+                gh api --method POST \
+                  "repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}/cancel" || true
+              fi
+            done
+
+      - name: Read alias configuration
+        id: alias
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          alias = json.loads(Path("alias/kdx.json").read_text())
+          with Path(os.environ["GITHUB_OUTPUT"]).open("a") as output:
+              for key in ("binary_name", "display_name", "env_prefix", "release_prefix"):
+                  print(f"{key}={alias[key]}", file=output)
+          PY
+
+      - name: Resolve latest stable upstream release
+        id: release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MANUAL_RUN: ${{ github.event_name != 'schedule' }}
+          RELEASE_PREFIX: ${{ steps.alias.outputs.release_prefix }}
+          REQUESTED_TAG: ${{ github.event.inputs.upstream_tag }}
+        run: |
+          set -euo pipefail
+          upstream_tag="$REQUESTED_TAG"
+          if [[ -z "$upstream_tag" ]]; then
+            upstream_tag="$(
+              curl --fail --silent --show-error --location \
+                --header "Accept: application/vnd.github+json" \
+                --header "Authorization: Bearer ${GH_TOKEN}" \
+                --header "X-GitHub-Api-Version: 2022-11-28" \
+                https://api.github.com/repos/openai/codex/releases/latest |
+                jq -er '.tag_name'
+            )"
+          fi
+          if [[ ! "$upstream_tag" =~ ^rust-v([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+            echo "Expected rust-vX.Y.Z, got: $upstream_tag" >&2
+            exit 1
+          fi
+
+          release_tag="${RELEASE_PREFIX}${BASH_REMATCH[1]}"
+          should_build=true
+          if [[ "$MANUAL_RUN" != "true" ]] && \
+             gh release view "$release_tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            should_build=false
+          fi
+          {
+            echo "upstream_tag=$upstream_tag"
+            echo "release_tag=$release_tag"
+            echo "should_build=$should_build"
+          } >> "$GITHUB_OUTPUT"
+
+  sync-main:
+    name: Rebase overlay onto upstream tag
+    needs: detect
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out fork history
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+
+      - name: Move main to upstream tag plus overlay
+        shell: bash
+        env:
+          UPSTREAM_TAG: ${{ needs.detect.outputs.upstream_tag }}
+        run: |
+          set -euo pipefail
+          overlay_commit="$GITHUB_SHA"
+          read -ra parents <<< "$(git show -s --format=%P "$overlay_commit")"
+          if [[ "${#parents[@]}" -ne 1 ]]; then
+            echo "Expected main to contain exactly one overlay commit" >&2
+            exit 1
+          fi
+
+          unexpected_paths="$(
+            git diff-tree --no-commit-id --name-only -r "$overlay_commit" |
+              grep -Ev '^(\.github/workflows/kdx-release\.yml|alias/)' || true
+          )"
+          if [[ -n "$unexpected_paths" ]]; then
+            echo "Overlay commit changes files outside the allowed paths:" >&2
+            echo "$unexpected_paths" >&2
+            exit 1
+          fi
+
+          git fetch --force --no-tags https://github.com/openai/codex.git \
+            "refs/tags/${UPSTREAM_TAG}:refs/tags/${UPSTREAM_TAG}"
+          upstream_commit="$(git rev-parse "${UPSTREAM_TAG}^{commit}")"
+          if [[ "${parents[0]}" == "$upstream_commit" ]]; then
+            echo "main is already based on ${UPSTREAM_TAG}"
+            exit 0
+          fi
+
+          git switch --detach "$upstream_commit"
+          git -c user.name="github-actions[bot]" \
+            -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+            cherry-pick "$overlay_commit"
+          git push \
+            --force-with-lease="refs/heads/main:${overlay_commit}" \
+            origin HEAD:refs/heads/main
+
+  build:
+    needs:
+      - detect
+      - sync-main
+    if: needs.detect.outputs.should_build == 'true'
+    runs-on: macos-15
+    timeout-minutes: 120
+    env:
+      BINARY_NAME: ${{ needs.detect.outputs.binary_name }}
+      DISPLAY_NAME: ${{ needs.detect.outputs.display_name }}
+      ENV_PREFIX: ${{ needs.detect.outputs.env_prefix }}
+      TARGET: aarch64-apple-darwin
+      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+      CARGO_PROFILE_RELEASE_DEBUG: "0"
+      CARGO_PROFILE_RELEASE_SPLIT_DEBUGINFO: "off"
+      CARGO_PROFILE_RELEASE_STRIP: "symbols"
+    steps:
+      - name: Check out alias overlay
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          path: overlay
+
+      - name: Check out exact upstream release
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: openai/codex
+          ref: ${{ needs.detect.outputs.upstream_tag }}
+          path: upstream
+          persist-credentials: false
+
+      - name: Apply configurable runtime identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 overlay/alias/scripts/test_apply_alias.py
+          python3 overlay/alias/scripts/apply-alias.py \
+            --root upstream \
+            --config overlay/alias/kdx.json
+          python3 overlay/alias/scripts/render-install.py \
+            --config overlay/alias/kdx.json \
+            --template overlay/alias/scripts/install.template.sh \
+            --output "${RUNNER_TEMP}/install.sh"
+          sh -n "${RUNNER_TEMP}/install.sh"
+
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: Configure rusty_v8 artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(python3 upstream/.github/scripts/rusty_v8_bazel.py resolved-v8-crate-version)"
+          base_url="https://github.com/openai/codex/releases/download/rusty-v8-v${version}"
+          binding_dir="${RUNNER_TEMP}/rusty_v8"
+          archive_path="${binding_dir}/librusty_v8_release_${TARGET}.a.gz"
+          binding_path="${binding_dir}/src_binding_release_${TARGET}.rs"
+          checksums_path="${binding_dir}/rusty_v8_release_${TARGET}.sha256"
+
+          mkdir -p "$binding_dir"
+          curl -fsSL "${base_url}/librusty_v8_release_${TARGET}.a.gz" -o "$archive_path"
+          curl -fsSL "${base_url}/src_binding_release_${TARGET}.rs" -o "$binding_path"
+          curl -fsSL "${base_url}/rusty_v8_release_${TARGET}.sha256" -o "$checksums_path"
+          test "$(wc -l < "$checksums_path")" -eq 2
+          (cd "$binding_dir" && shasum -a 256 -c "$checksums_path")
+          {
+            echo "RUSTY_V8_ARCHIVE=$archive_path"
+            echo "RUSTY_V8_SRC_BINDING_PATH=$binding_path"
+          } >> "$GITHUB_ENV"
+
+      - name: Build arm64 release binaries
+        working-directory: upstream/codex-rs
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build \
+            --target "$TARGET" \
+            --release \
+            --timings \
+            --bin "$BINARY_NAME" \
+            --bin "${BINARY_NAME}-code-mode-host"
+
+      - name: Stage, sign, and verify bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          release_dir="upstream/codex-rs/target/${TARGET}/release"
+          dist="${RUNNER_TEMP}/${BINARY_NAME}-${TARGET}"
+          host_name="${BINARY_NAME}-code-mode-host"
+          mkdir -p "$dist"
+          cp "$release_dir/$BINARY_NAME" "$dist/$BINARY_NAME"
+          cp "$release_dir/$host_name" "$dist/$host_name"
+          chmod 0755 "$dist/$BINARY_NAME" "$dist/$host_name"
+
+          for executable in "$dist/$BINARY_NAME" "$dist/$host_name"; do
+            strip -x "$executable"
+            identifier="com.kaijun.$(basename "$executable" | tr '-' '.')"
+            codesign --force --sign - --identifier "$identifier" --timestamp=none "$executable"
+            test "$(lipo -archs "$executable")" = "arm64"
+            codesign --verify --strict --verbose=2 "$executable"
+            if codesign -dv --verbose=4 "$executable" 2>&1 | grep -Eqi 'codex'; then
+              echo "Forbidden legacy identity in code signature: $executable" >&2
+              exit 1
+            fi
+            if [[ "$(basename "$executable")" == "$BINARY_NAME" ]] && \
+              ! grep -aFq "${ENV_PREFIX}_HOME" "$executable"; then
+              echo "Missing aliased home environment variable in binary: $executable" >&2
+              exit 1
+            fi
+          done
+
+          "$dist/$BINARY_NAME" --version
+          "$dist/$BINARY_NAME" --help | grep -F "Usage: $BINARY_NAME"
+          tar -C "$RUNNER_TEMP" -czf \
+            "${RUNNER_TEMP}/${BINARY_NAME}-${TARGET}.tar.gz" \
+            "${BINARY_NAME}-${TARGET}"
+          shasum -a 256 "${RUNNER_TEMP}/${BINARY_NAME}-${TARGET}.tar.gz" > \
+            "${RUNNER_TEMP}/${BINARY_NAME}-${TARGET}.tar.gz.sha256"
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: ${{ needs.detect.outputs.binary_name }}-aarch64-apple-darwin
+          path: |
+            ${{ runner.temp }}/${{ needs.detect.outputs.binary_name }}-aarch64-apple-darwin.tar.gz
+            ${{ runner.temp }}/${{ needs.detect.outputs.binary_name }}-aarch64-apple-darwin.tar.gz.sha256
+            ${{ runner.temp }}/install.sh
+          if-no-files-found: error
+
+      - name: Publish release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.detect.outputs.release_tag }}
+          UPSTREAM_TAG: ${{ needs.detect.outputs.upstream_tag }}
+        run: |
+          set -euo pipefail
+          assets=(
+            "${RUNNER_TEMP}/${BINARY_NAME}-${TARGET}.tar.gz"
+            "${RUNNER_TEMP}/${BINARY_NAME}-${TARGET}.tar.gz.sha256"
+            "${RUNNER_TEMP}/install.sh"
+          )
+          notes="Built from upstream ${UPSTREAM_TAG} for macOS arm64. Binaries use ad-hoc signatures."
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" "${assets[@]}" --repo "$GITHUB_REPOSITORY" --clobber
+            gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --notes "$notes"
+          else
+            gh release create "$RELEASE_TAG" "${assets[@]}" \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --title "${DISPLAY_NAME} ${RELEASE_TAG}" \
+              --notes "$notes"
+          fi

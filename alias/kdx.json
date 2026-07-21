@@ -1,0 +1,8 @@
+{
+  "display_name": "KDX",
+  "binary_name": "kdx",
+  "home_dir": ".kdx",
+  "env_prefix": "KDX",
+  "repository": "Kaijun/kodex",
+  "release_prefix": "kdx-v"
+}

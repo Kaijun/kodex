@@ -1,9 +1,9 @@
-name: alias-release
+name: KDX release
 
 on:
   push:
     branches:
-      - main
+      - kdx-overlay
     paths:
       - ".github/workflows/kdx-release.yml"
       - "alias/**"
@@ -17,7 +17,7 @@ on:
     - cron: "17 * * * *"
 
 concurrency:
-  group: alias-release
+  group: kdx-release
   cancel-in-progress: false
 
 permissions:
@@ -35,8 +35,10 @@ jobs:
       should_build: ${{ steps.release.outputs.should_build }}
       upstream_tag: ${{ steps.release.outputs.upstream_tag }}
     steps:
-      - name: Check out alias overlay
+      - name: Check out KDX overlay
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: kdx-overlay
 
       - name: Disable unrelated fork workflows
         if: github.repository == 'Kaijun/kodex'
@@ -124,22 +126,23 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
   sync-main:
-    name: Rebase overlay onto upstream tag
+    name: Generate one-commit main
     needs: detect
     runs-on: ubuntu-latest
     steps:
-      - name: Check out fork history
+      - name: Check out KDX overlay history
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
+          ref: kdx-overlay
           fetch-depth: 0
 
-      - name: Squash overlay onto upstream tag
+      - name: Generate main from upstream and overlay
         shell: bash
         env:
           UPSTREAM_TAG: ${{ needs.detect.outputs.upstream_tag }}
         run: |
           set -euo pipefail
-          overlay_commit="$GITHUB_SHA"
+          overlay_commit="$(git rev-parse HEAD)"
           overlay_dir="$(mktemp -d)"
           trap 'rm -rf "$overlay_dir"' EXIT
 
@@ -147,14 +150,14 @@ jobs:
             .github/workflows/kdx-release.yml alias |
             tar -x -C "$overlay_dir"
 
+          git fetch --force origin \
+            "+refs/heads/main:refs/remotes/origin/main"
+          main_commit="$(git rev-parse refs/remotes/origin/main)"
+
           git fetch --force --no-tags https://github.com/openai/codex.git \
             "refs/tags/${UPSTREAM_TAG}:refs/tags/${UPSTREAM_TAG}"
           upstream_commit="$(git rev-parse "${UPSTREAM_TAG}^{commit}")"
-          parent_commit="$(git show -s --format=%P "$overlay_commit")"
-          if [[ "$parent_commit" == "$upstream_commit" ]]; then
-            echo "main already contains one overlay commit on ${UPSTREAM_TAG}"
-            exit 0
-          fi
+          main_parent="$(git show -s --format=%P "$main_commit")"
 
           git switch --detach "$upstream_commit"
           rm -rf alias
@@ -162,12 +165,20 @@ jobs:
           cp "$overlay_dir/.github/workflows/kdx-release.yml" \
             .github/workflows/kdx-release.yml
           cp -R "$overlay_dir/alias" alias
+
           git add .github/workflows/kdx-release.yml alias
+          if [[ "$main_parent" == "$upstream_commit" ]] && \
+             git diff --cached --quiet "$main_commit" -- \
+               .github/workflows/kdx-release.yml alias; then
+            echo "main already contains the current overlay on ${UPSTREAM_TAG}"
+            exit 0
+          fi
+
           git -c user.name="github-actions[bot]" \
             -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
             commit -m "Maintain KDX alias overlay"
           git push \
-            --force-with-lease="refs/heads/main:${overlay_commit}" \
+            --force-with-lease="refs/heads/main:${main_commit}" \
             origin HEAD:refs/heads/main
 
   build:
@@ -187,9 +198,10 @@ jobs:
       CARGO_PROFILE_RELEASE_SPLIT_DEBUGINFO: "off"
       CARGO_PROFILE_RELEASE_STRIP: "symbols"
     steps:
-      - name: Check out alias overlay
+      - name: Check out KDX overlay
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
+          ref: kdx-overlay
           path: overlay
 
       - name: Check out exact upstream release
@@ -319,7 +331,7 @@ jobs:
           else
             gh release create "$RELEASE_TAG" "${assets[@]}" \
               --repo "$GITHUB_REPOSITORY" \
-              --target "$GITHUB_SHA" \
+              --target main \
               --title "${DISPLAY_NAME} ${RELEASE_TAG}" \
               --notes "$notes"
           fi

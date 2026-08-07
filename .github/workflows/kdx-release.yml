@@ -148,34 +148,33 @@ jobs:
             exit 1
           fi
           overlay_commit="$GITHUB_SHA"
-          read -ra parents <<< "$(git show -s --format=%P "$overlay_commit")"
-          if [[ "${#parents[@]}" -ne 1 ]]; then
-            echo "Expected main to contain exactly one overlay commit" >&2
-            exit 1
-          fi
-
-          unexpected_paths="$(
-            git diff-tree --no-commit-id --name-only -r "$overlay_commit" |
-              grep -Ev '^(\.github/workflows/kdx-release\.yml|alias/)' || true
-          )"
-          if [[ -n "$unexpected_paths" ]]; then
-            echo "Overlay commit changes files outside the allowed paths:" >&2
-            echo "$unexpected_paths" >&2
-            exit 1
-          fi
-
           git fetch --force --no-tags https://github.com/openai/codex.git \
             "refs/tags/${UPSTREAM_TAG}:refs/tags/${UPSTREAM_TAG}"
           upstream_commit="$(git rev-parse "${UPSTREAM_TAG}^{commit}")"
-          if [[ "${parents[0]}" == "$upstream_commit" ]]; then
+          overlay_base="$(git merge-base "$overlay_commit" "$upstream_commit")"
+          if [[ -z "$overlay_base" ]]; then
+            echo "Could not find an overlay base shared with ${UPSTREAM_TAG}" >&2
+            exit 1
+          fi
+          unexpected_paths="$(
+            git diff --name-only "$overlay_base" "$overlay_commit" |
+              grep -Ev '^(\.github/workflows/kdx-release\.yml|README\.md|scripts/rebrand_codex_vsix\.py)$|^alias/' || true
+          )"
+          if [[ -n "$unexpected_paths" ]]; then
+            echo "Overlay changes files outside the allowed paths:" >&2
+            echo "$unexpected_paths" >&2
+            exit 1
+          fi
+          if [[ "$overlay_base" == "$upstream_commit" ]]; then
             echo "main is already based on ${UPSTREAM_TAG}"
             exit 0
           fi
 
           git switch --detach "$upstream_commit"
+          git diff --binary "$overlay_base" "$overlay_commit" | git apply --index
           git -c user.name="github-actions[bot]" \
             -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
-            cherry-pick "$overlay_commit"
+            commit -m "chore: apply KDX overlay"
           git push \
             --force-with-lease="refs/heads/main:${overlay_commit}" \
             origin HEAD:refs/heads/main

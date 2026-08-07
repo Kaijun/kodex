@@ -36,19 +36,31 @@ def load_alias(path: Path) -> dict[str, str]:
 
 def replace_exact(path: Path, old: str, new: str, expected: int | None = None) -> None:
     source = path.read_text()
+    path.write_text(
+        replace_exact_text(source, old, new, expected, source_name=str(path))
+    )
+
+
+def replace_exact_text(
+    source: str,
+    old: str,
+    new: str,
+    expected: int | None = None,
+    *,
+    source_name: str = "source",
+) -> str:
     count = source.count(old)
     if expected is not None and count != expected:
         raise RuntimeError(
-            f"{path}: expected {expected} occurrence(s) of {old!r}, found {count}"
+            f"{source_name}: expected {expected} occurrence(s) of {old!r}, found {count}"
         )
-    if count:
-        path.write_text(source.replace(old, new))
+    return source.replace(old, new)
 
 
 def rewrite_rust_source(source: str, alias: dict[str, str]) -> str:
     binary = alias["binary_name"]
     replacements = (
-        ("CODEX_", f'{alias["env_prefix"]}_'),
+        ("CODEX_", f"{alias['env_prefix']}_"),
         (".codex-plugin", f".{binary}-plugin"),
         ("codex-code-mode-host", f"{binary}-code-mode-host"),
         ("codex-command-runner", f"{binary}-command-runner"),
@@ -65,9 +77,7 @@ def rewrite_rust_source(source: str, alias: dict[str, str]) -> str:
     for old, new in replacements:
         source = source.replace(old, new)
     for suffix in RUST_DOT_CODEX_SUFFIXES:
-        source = source.replace(
-            f".codex{suffix}", f'{alias["home_dir"]}{suffix}'
-        )
+        source = source.replace(f".codex{suffix}", f"{alias['home_dir']}{suffix}")
     return source
 
 
@@ -83,11 +93,27 @@ def apply_runtime_identity(root: Path, alias: dict[str, str]) -> None:
 
     binary_targets = (
         ("cli/Cargo.toml", "codex", binary),
-        ("code-mode-host/Cargo.toml", "codex-code-mode-host", f"{binary}-code-mode-host"),
+        (
+            "code-mode-host/Cargo.toml",
+            "codex-code-mode-host",
+            f"{binary}-code-mode-host",
+        ),
         ("linux-sandbox/Cargo.toml", "codex-linux-sandbox", f"{binary}-linux-sandbox"),
-        ("shell-escalation/Cargo.toml", "codex-execve-wrapper", f"{binary}-execve-wrapper"),
-        ("windows-sandbox-rs/Cargo.toml", "codex-windows-sandbox-setup", f"{binary}-windows-sandbox-setup"),
-        ("windows-sandbox-rs/Cargo.toml", "codex-command-runner", f"{binary}-command-runner"),
+        (
+            "shell-escalation/Cargo.toml",
+            "codex-execve-wrapper",
+            f"{binary}-execve-wrapper",
+        ),
+        (
+            "windows-sandbox-rs/Cargo.toml",
+            "codex-windows-sandbox-setup",
+            f"{binary}-windows-sandbox-setup",
+        ),
+        (
+            "windows-sandbox-rs/Cargo.toml",
+            "codex-command-runner",
+            f"{binary}-command-runner",
+        ),
     )
     for relative_path, old_name, new_name in binary_targets:
         replace_exact(
@@ -97,12 +123,19 @@ def apply_runtime_identity(root: Path, alias: dict[str, str]) -> None:
             1,
         )
 
+    replace_exact(
+        source_root / "cli/Cargo.toml",
+        'default-run = "codex"',
+        f'default-run = "{binary}"',
+        1,
+    )
+
     cli = source_root / "cli/src/main.rs"
     replace_exact(cli, "/// Codex CLI", f"/// {display} CLI", 1)
     replace_exact(
         cli,
         "#[clap(\n    author,",
-        f"#[clap(\n    name = \"{binary}\",\n    author,",
+        f'#[clap(\n    name = "{binary}",\n    author,',
         1,
     )
     replace_exact(cli, 'bin_name = "codex",', f'bin_name = "{binary}",', 1)

@@ -9,6 +9,46 @@ If you want Codex in your code editor (VS Code, Cursor, Windsurf), <a href="http
 
 ---
 
+## KDX overlay
+
+This fork applies the alias configuration in `alias/kdx.json` to an exact
+upstream Codex release. The release workflow builds the renamed `kdx` and
+`kdx-code-mode-host` executables; no separate ACP sidecar is required.
+
+### Repackaging the VS Code extension
+
+The VS Code extension source is not part of this repository. The
+`scripts/rebrand_codex_vsix.py` script downloads the latest platform-specific
+`openai.chatgpt` VSIX from the Visual Studio Marketplace, rewrites its extension
+identity and user-visible branding, installs a locally built KDX runtime, and
+creates a new VSIX.
+
+Build the KDX runtime first, then pass the release output directory containing
+both `kdx` and `kdx-code-mode-host`:
+
+```shell
+python3 scripts/rebrand_codex_vsix.py \
+  --platform darwin-arm64 \
+  --runtime-dir /path/to/codex-rs/target/release \
+  --output kdx-darwin-arm64.vsix
+```
+
+Use `--input-vsix /path/to/source.vsix` to patch a pinned or previously
+downloaded package instead of querying the Marketplace. The repacker validates
+the ZIP, extension identity, KDX runtime entry, executable mode, and legacy
+branded paths before returning success.
+
+KDX stores user state under `~/.kdx` and discovers project configuration from
+`.kdx/`. The upstream source checkout also contains a Git-tracked `.codex/`
+directory for repository-specific environments and skills; that source metadata
+predates the KDX extension and is not created or used as KDX runtime state.
+
+Public app-server wire fields and internal Rust crate/protocol names remain
+unchanged where required for compatibility. They are not extension branding and
+must not be replaced blindly.
+
+---
+
 ## Quickstart
 
 ### Installing and running Codex CLI

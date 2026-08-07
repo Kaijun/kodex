@@ -42,5 +42,29 @@ class RewriteRustSourceTest(unittest.TestCase):
         self.assertEqual(APPLY_ALIAS.rewrite_rust_source(source, ALIAS), source)
 
 
+class ReplaceExactTextTest(unittest.TestCase):
+    def test_rewrites_cli_default_run(self) -> None:
+        source = '[package]\ndefault-run = "codex"\n\n[[bin]]\nname = "kdx"\n'
+        expected = '[package]\ndefault-run = "kdx"\n\n[[bin]]\nname = "kdx"\n'
+        self.assertEqual(
+            APPLY_ALIAS.replace_exact_text(
+                source,
+                'default-run = "codex"',
+                'default-run = "kdx"',
+                1,
+            ),
+            expected,
+        )
+
+    def test_rejects_missing_cli_default_run(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "expected 1 occurrence"):
+            APPLY_ALIAS.replace_exact_text(
+                '[package]\nname = "codex-cli"\n',
+                'default-run = "codex"',
+                'default-run = "kdx"',
+                1,
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

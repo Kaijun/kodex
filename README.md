@@ -9,6 +9,41 @@ If you want Codex in your code editor (VS Code, Cursor, Windsurf), <a href="http
 
 ---
 
+## KDX overlay
+
+This fork applies the alias configuration in `alias/kdx.json` to an exact
+upstream Codex release. The release workflow builds the renamed `kdx` and
+`kdx-code-mode-host` executables; no separate ACP sidecar is required.
+
+### Repackaging the VS Code extension
+
+The VS Code extension source is not part of this repository. Everything used to
+detect, patch, test, and document the repackaged extension lives in
+[`alias/vsix/`](alias/vsix/README.md).
+The default package contains no native runtime and resolves a locally installed
+`kdx` when it starts:
+
+```shell
+python3 alias/vsix/rebrand.py \
+  --platform darwin-arm64 \
+  --output kdx-darwin-arm64.vsix
+```
+
+Use `--input-vsix /path/to/source.vsix` to patch a pinned or previously
+downloaded package. See [`alias/vsix/README.md`](alias/vsix/README.md) for external CLI
+resolution, scheduled releases, update checks, and the optional bundled mode.
+
+KDX stores user state under `~/.kdx` and discovers project configuration from
+`.kdx/`. The upstream source checkout also contains a Git-tracked `.codex/`
+directory for repository-specific environments and skills; that source metadata
+predates the KDX extension and is not created or used as KDX runtime state.
+
+Public app-server wire fields and internal Rust crate/protocol names remain
+unchanged where required for compatibility. They are not extension branding and
+must not be replaced blindly.
+
+---
+
 ## Quickstart
 
 ### Installing and running Codex CLI

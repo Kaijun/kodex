@@ -1,0 +1,539 @@
+name: alias-release
+
+on:
+  push:
+    branches:
+      - kdx-overlay
+    paths:
+      - ".github/workflows/kdx-release.yml"
+      - "alias/**"
+  workflow_dispatch:
+    inputs:
+      upstream_tag:
+        description: Optional stable upstream tag, for example rust-v0.144.5
+        required: false
+        type: string
+      force_cli:
+        description: Rebuild CLI assets even when the current release is complete
+        required: false
+        default: false
+        type: boolean
+      force_vsix:
+        description: Rebuild the current VSIX asset even when it already exists
+        required: false
+        default: false
+        type: boolean
+  schedule:
+    - cron: "17 * * * *"
+
+concurrency:
+  group: alias-release
+  cancel-in-progress: false
+
+permissions:
+  actions: write
+  contents: write
+
+jobs:
+  detect:
+    runs-on: ubuntu-latest
+    outputs:
+      binary_name: ${{ steps.alias.outputs.binary_name }}
+      display_name: ${{ steps.alias.outputs.display_name }}
+      env_prefix: ${{ steps.alias.outputs.env_prefix }}
+      release_tag: ${{ steps.release.outputs.release_tag }}
+      should_build_cli: ${{ steps.release.outputs.should_build_cli }}
+      should_build_vsix: ${{ steps.release.outputs.should_build_vsix }}
+      upstream_tag: ${{ steps.release.outputs.upstream_tag }}
+      vsix_asset: ${{ steps.release.outputs.vsix_asset }}
+      vsix_build: ${{ steps.release.outputs.vsix_build }}
+      vsix_version: ${{ steps.release.outputs.vsix_version }}
+    steps:
+      - name: Check out alias overlay
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Validate VSIX tooling
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m py_compile alias/vsix/rebrand.py
+          node --check alias/vsix/extension-wrapper.js
+          node alias/vsix/test-wrapper.js
+
+      - name: Disable unrelated fork workflows
+        if: github.repository == 'Kaijun/kodex'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          current_workflow=".github/workflows/kdx-release.yml"
+          gh api --paginate \
+            "repos/${GITHUB_REPOSITORY}/actions/workflows?per_page=100" \
+            --jq '.workflows[] | select(.state == "active") | [.id, .path] | @tsv' |
+            while IFS=$'\t' read -r workflow_id workflow_path; do
+              if [[ "$workflow_path" != "$current_workflow" ]]; then
+                echo "Disabling $workflow_path"
+                gh api --method PUT \
+                  "repos/${GITHUB_REPOSITORY}/actions/workflows/${workflow_id}/disable" ||
+                  echo "::warning::Could not disable $workflow_path"
+              fi
+            done
+
+          gh api --paginate \
+            "repos/${GITHUB_REPOSITORY}/actions/runs?status=in_progress&per_page=100" \
+            --jq '.workflow_runs[] | [.id, .head_sha, .path] | @tsv' |
+            while IFS=$'\t' read -r run_id head_sha workflow_path; do
+              if [[ "$run_id" != "$GITHUB_RUN_ID" && "$head_sha" == "$GITHUB_SHA" ]]; then
+                echo "Cancelling $workflow_path run $run_id"
+                gh api --method POST \
+                  "repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}/cancel" || true
+              fi
+            done
+
+      - name: Read alias configuration
+        id: alias
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          alias = json.loads(Path("alias/kdx.json").read_text())
+          with Path(os.environ["GITHUB_OUTPUT"]).open("a") as output:
+              for key in ("binary_name", "display_name", "env_prefix", "release_prefix"):
+                  print(f"{key}={alias[key]}", file=output)
+          PY
+
+      - name: Resolve latest stable upstream release
+        id: release
+        shell: bash
+        env:
+          BINARY_NAME: ${{ steps.alias.outputs.binary_name }}
+          FORCE_CLI: ${{ github.event_name == 'workflow_dispatch' && inputs.force_cli }}
+          FORCE_VSIX: ${{ github.event_name == 'workflow_dispatch' && inputs.force_vsix }}
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_PREFIX: ${{ steps.alias.outputs.release_prefix }}
+          REQUESTED_TAG: ${{ github.event.inputs.upstream_tag }}
+        run: |
+          set -euo pipefail
+          upstream_tag="$REQUESTED_TAG"
+          if [[ -z "$upstream_tag" ]]; then
+            upstream_tag="$(
+              curl --fail --silent --show-error --location \
+                --header "Accept: application/vnd.github+json" \
+                --header "Authorization: Bearer ${GH_TOKEN}" \
+                --header "X-GitHub-Api-Version: 2022-11-28" \
+                https://api.github.com/repos/openai/codex/releases/latest |
+                jq -er '.tag_name'
+            )"
+          fi
+          if [[ ! "$upstream_tag" =~ ^rust-v([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+            echo "Expected rust-vX.Y.Z, got: $upstream_tag" >&2
+            exit 1
+          fi
+
+          release_tag="${RELEASE_PREFIX}${BASH_REMATCH[1]}"
+          vsix_json="$(
+            python3 alias/vsix/rebrand.py \
+              --platform darwin-arm64 \
+              --print-latest-json
+          )"
+          vsix_version="$(jq -er '.version' <<< "$vsix_json")"
+          vsix_build="$(jq -er '.build' <<< "$vsix_json")"
+          vsix_asset="kdx-${vsix_version}-${vsix_build}-darwin-arm64.vsix"
+
+          should_build_cli="$FORCE_CLI"
+          should_build_vsix="$FORCE_VSIX"
+          if gh release view "$release_tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            release_assets="$(gh release view "$release_tag" \
+              --repo "$GITHUB_REPOSITORY" \
+              --json assets \
+              --jq '.assets[].name')"
+            for cli_asset in \
+              "${BINARY_NAME}-aarch64-apple-darwin.tar.gz" \
+              "${BINARY_NAME}-aarch64-apple-darwin.tar.gz.sha256" \
+              "install.sh"; do
+              if ! grep -Fxq "$cli_asset" <<< "$release_assets"; then
+                should_build_cli=true
+              fi
+            done
+            if ! grep -Fxq "$vsix_asset" <<< "$release_assets" || \
+              ! grep -Fxq "install.sh.sha256" <<< "$release_assets"; then
+              should_build_vsix=true
+            fi
+          else
+            should_build_cli=true
+            should_build_vsix=true
+          fi
+          {
+            echo "upstream_tag=$upstream_tag"
+            echo "release_tag=$release_tag"
+            echo "should_build_cli=$should_build_cli"
+            echo "should_build_vsix=$should_build_vsix"
+            echo "vsix_asset=$vsix_asset"
+            echo "vsix_build=$vsix_build"
+            echo "vsix_version=$vsix_version"
+          } >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: detect
+    if: needs.detect.outputs.should_build_cli == 'true'
+    runs-on: macos-15
+    timeout-minutes: 120
+    env:
+      BINARY_NAME: ${{ needs.detect.outputs.binary_name }}
+      DISPLAY_NAME: ${{ needs.detect.outputs.display_name }}
+      ENV_PREFIX: ${{ needs.detect.outputs.env_prefix }}
+      TARGET: aarch64-apple-darwin
+      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+      CARGO_PROFILE_RELEASE_DEBUG: "0"
+      CARGO_PROFILE_RELEASE_SPLIT_DEBUGINFO: "off"
+      CARGO_PROFILE_RELEASE_STRIP: "symbols"
+    steps:
+      - name: Check out alias overlay
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          path: overlay
+
+      - name: Check out exact upstream release
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: openai/codex
+          ref: ${{ needs.detect.outputs.upstream_tag }}
+          path: upstream
+          persist-credentials: false
+
+      - name: Apply configurable runtime identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 overlay/alias/scripts/test_apply_alias.py
+          python3 overlay/alias/scripts/apply-alias.py \
+            --root upstream \
+            --config overlay/alias/kdx.json
+          python3 overlay/alias/scripts/render-install.py \
+            --config overlay/alias/kdx.json \
+            --template overlay/alias/scripts/install.template.sh \
+            --output "${RUNNER_TEMP}/install.sh"
+          sh -n "${RUNNER_TEMP}/install.sh"
+
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: Configure rusty_v8 artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(python3 upstream/.github/scripts/rusty_v8_bazel.py resolved-v8-crate-version)"
+          base_url="https://github.com/openai/codex/releases/download/rusty-v8-v${version}"
+          binding_dir="${RUNNER_TEMP}/rusty_v8"
+          archive_path="${binding_dir}/librusty_v8_release_${TARGET}.a.gz"
+          binding_path="${binding_dir}/src_binding_release_${TARGET}.rs"
+          checksums_path="${binding_dir}/rusty_v8_release_${TARGET}.sha256"
+
+          mkdir -p "$binding_dir"
+          curl -fsSL "${base_url}/librusty_v8_release_${TARGET}.a.gz" -o "$archive_path"
+          curl -fsSL "${base_url}/src_binding_release_${TARGET}.rs" -o "$binding_path"
+          curl -fsSL "${base_url}/rusty_v8_release_${TARGET}.sha256" -o "$checksums_path"
+          test "$(wc -l < "$checksums_path")" -eq 2
+          (cd "$binding_dir" && shasum -a 256 -c "$checksums_path")
+          {
+            echo "RUSTY_V8_ARCHIVE=$archive_path"
+            echo "RUSTY_V8_SRC_BINDING_PATH=$binding_path"
+          } >> "$GITHUB_ENV"
+
+      - name: Build arm64 release binaries
+        working-directory: upstream/codex-rs
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build \
+            --target "$TARGET" \
+            --release \
+            --timings \
+            --bin "$BINARY_NAME" \
+            --bin "${BINARY_NAME}-code-mode-host"
+
+      - name: Stage, sign, and verify bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          release_dir="upstream/codex-rs/target/${TARGET}/release"
+          dist="${RUNNER_TEMP}/${BINARY_NAME}-${TARGET}"
+          host_name="${BINARY_NAME}-code-mode-host"
+          mkdir -p "$dist"
+          cp "$release_dir/$BINARY_NAME" "$dist/$BINARY_NAME"
+          cp "$release_dir/$host_name" "$dist/$host_name"
+          chmod 0755 "$dist/$BINARY_NAME" "$dist/$host_name"
+
+          for executable in "$dist/$BINARY_NAME" "$dist/$host_name"; do
+            strip -x "$executable"
+            identifier="com.kaijun.$(basename "$executable" | tr '-' '.')"
+            codesign --force --sign - --identifier "$identifier" --timestamp=none "$executable"
+            test "$(lipo -archs "$executable")" = "arm64"
+            codesign --verify --strict --verbose=2 "$executable"
+            if codesign -dv --verbose=4 "$executable" 2>&1 | grep -Eqi 'codex'; then
+              echo "Forbidden legacy identity in code signature: $executable" >&2
+              exit 1
+            fi
+            if [[ "$(basename "$executable")" == "$BINARY_NAME" ]] && \
+              ! grep -aFq "${ENV_PREFIX}_HOME" "$executable"; then
+              echo "Missing aliased home environment variable in binary: $executable" >&2
+              exit 1
+            fi
+          done
+
+          "$dist/$BINARY_NAME" --version
+          "$dist/$BINARY_NAME" --help | grep -F "Usage: $BINARY_NAME"
+          tar -C "$RUNNER_TEMP" -czf \
+            "${RUNNER_TEMP}/${BINARY_NAME}-${TARGET}.tar.gz" \
+            "${BINARY_NAME}-${TARGET}"
+          shasum -a 256 "${RUNNER_TEMP}/${BINARY_NAME}-${TARGET}.tar.gz" > \
+            "${RUNNER_TEMP}/${BINARY_NAME}-${TARGET}.tar.gz.sha256"
+          shasum -a 256 "${RUNNER_TEMP}/install.sh" > \
+            "${RUNNER_TEMP}/install.sh.sha256"
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: ${{ needs.detect.outputs.binary_name }}-aarch64-apple-darwin
+          path: |
+            ${{ runner.temp }}/${{ needs.detect.outputs.binary_name }}-aarch64-apple-darwin.tar.gz
+            ${{ runner.temp }}/${{ needs.detect.outputs.binary_name }}-aarch64-apple-darwin.tar.gz.sha256
+            ${{ runner.temp }}/install.sh
+            ${{ runner.temp }}/install.sh.sha256
+          if-no-files-found: error
+
+      - name: Publish release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.detect.outputs.release_tag }}
+          UPSTREAM_TAG: ${{ needs.detect.outputs.upstream_tag }}
+        run: |
+          set -euo pipefail
+          assets=(
+            "${RUNNER_TEMP}/${BINARY_NAME}-${TARGET}.tar.gz"
+            "${RUNNER_TEMP}/${BINARY_NAME}-${TARGET}.tar.gz.sha256"
+            "${RUNNER_TEMP}/install.sh"
+            "${RUNNER_TEMP}/install.sh.sha256"
+          )
+          notes="Built from upstream ${UPSTREAM_TAG} for macOS arm64. Binaries use ad-hoc signatures."
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" "${assets[@]}" --repo "$GITHUB_REPOSITORY" --clobber
+            gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --notes "$notes"
+          else
+            gh release create "$RELEASE_TAG" "${assets[@]}" \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --title "${DISPLAY_NAME} ${RELEASE_TAG}" \
+              --notes "$notes"
+          fi
+
+  vsix:
+    name: Repackage external-runtime VSIX
+    needs:
+      - detect
+      - build
+    if: >-
+      always() &&
+      needs.detect.outputs.should_build_vsix == 'true' &&
+      (needs.build.result == 'success' || needs.build.result == 'skipped')
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out KDX overlay
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Download and repackage upstream VSIX
+        shell: bash
+        env:
+          VSIX_ASSET: ${{ needs.detect.outputs.vsix_asset }}
+        run: |
+          set -euo pipefail
+          python3 alias/vsix/rebrand.py \
+            --platform darwin-arm64 \
+            --output "${RUNNER_TEMP}/${VSIX_ASSET}"
+          if unzip -l "${RUNNER_TEMP}/${VSIX_ASSET}" | grep -q 'extension/bin/'; then
+            echo "External-runtime VSIX unexpectedly contains extension/bin files" >&2
+            exit 1
+          fi
+          (
+            cd "$RUNNER_TEMP"
+            shasum -a 256 "$VSIX_ASSET" > "${VSIX_ASSET}.sha256"
+          )
+
+      - name: Upload VSIX workflow artifact
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: kdx-vsix-darwin-arm64
+          path: |
+            ${{ runner.temp }}/${{ needs.detect.outputs.vsix_asset }}
+            ${{ runner.temp }}/${{ needs.detect.outputs.vsix_asset }}.sha256
+          if-no-files-found: error
+
+      - name: Publish VSIX to KDX release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.detect.outputs.release_tag }}
+          UPSTREAM_TAG: ${{ needs.detect.outputs.upstream_tag }}
+          VSIX_ASSET: ${{ needs.detect.outputs.vsix_asset }}
+          VSIX_BUILD: ${{ needs.detect.outputs.vsix_build }}
+          VSIX_VERSION: ${{ needs.detect.outputs.vsix_version }}
+        run: |
+          set -euo pipefail
+          gh release download "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern "install.sh" \
+            --dir "$RUNNER_TEMP"
+          shasum -a 256 "${RUNNER_TEMP}/install.sh" > \
+            "${RUNNER_TEMP}/install.sh.sha256"
+          assets=(
+            "${RUNNER_TEMP}/${VSIX_ASSET}"
+            "${RUNNER_TEMP}/${VSIX_ASSET}.sha256"
+            "${RUNNER_TEMP}/install.sh.sha256"
+            "${RUNNER_TEMP}/kdx-update.json"
+          )
+          release_url="https://github.com/${GITHUB_REPOSITORY}/releases/tag/${RELEASE_TAG}"
+          download_url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}"
+          jq -n \
+            --arg tag_name "$RELEASE_TAG" \
+            --arg html_url "$release_url" \
+            --arg vsix_build "$VSIX_BUILD" \
+            --arg vsix_name "$VSIX_ASSET" \
+            --arg vsix_url "${download_url}/${VSIX_ASSET}" \
+            --arg vsix_version "$VSIX_VERSION" \
+            --arg checksum_name "${VSIX_ASSET}.sha256" \
+            --arg checksum_url "${download_url}/${VSIX_ASSET}.sha256" \
+            --arg installer_name "install.sh" \
+            --arg installer_url "${download_url}/install.sh" \
+            --arg installer_checksum_name "install.sh.sha256" \
+            --arg installer_checksum_url "${download_url}/install.sh.sha256" \
+            '{
+              tag_name: $tag_name,
+              html_url: $html_url,
+              vsix_build: $vsix_build,
+              vsix_version: $vsix_version,
+              assets: [
+                {name: $vsix_name, browser_download_url: $vsix_url},
+                {name: $checksum_name, browser_download_url: $checksum_url},
+                {name: $installer_name, browser_download_url: $installer_url},
+                {name: $installer_checksum_name, browser_download_url: $installer_checksum_url}
+              ]
+            }' > "${RUNNER_TEMP}/kdx-update.json"
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" "${assets[@]}" \
+              --repo "$GITHUB_REPOSITORY" \
+              --clobber
+          else
+            notes="KDX ${RELEASE_TAG}, built from ${UPSTREAM_TAG}; VSIX ${VSIX_VERSION} uses a local KDX CLI."
+            gh release create "$RELEASE_TAG" "${assets[@]}" \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --title "KDX ${RELEASE_TAG}" \
+              --notes "$notes"
+          fi
+
+  promote:
+    name: Promote verified overlay to main and kdx-overlay
+    needs:
+      - detect
+      - build
+      - vsix
+    if: >-
+      always() &&
+      needs.detect.result == 'success' &&
+      (needs.build.result == 'success' || needs.build.result == 'skipped') &&
+      (needs.vsix.result == 'success' || needs.vsix.result == 'skipped')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out tested overlay history
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.KDX_RELEASE_TOKEN }}
+
+      - name: Squash overlay onto upstream and promote atomically
+        shell: bash
+        env:
+          KDX_RELEASE_TOKEN: ${{ secrets.KDX_RELEASE_TOKEN }}
+          UPSTREAM_TAG: ${{ needs.detect.outputs.upstream_tag }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$KDX_RELEASE_TOKEN" ]]; then
+            echo "KDX_RELEASE_TOKEN is required to promote verified branches." >&2
+            exit 1
+          fi
+
+          source_commit="$GITHUB_SHA"
+          git fetch --force --no-tags origin \
+            refs/heads/main:refs/remotes/origin/main \
+            refs/heads/kdx-overlay:refs/remotes/origin/kdx-overlay
+          main_commit="$(git rev-parse refs/remotes/origin/main)"
+          overlay_commit="$(git rev-parse refs/remotes/origin/kdx-overlay)"
+
+          overlay_version="$(
+            git show "${source_commit}:codex-rs/Cargo.toml" |
+              python3 -c \
+                'import sys, tomllib; print(tomllib.loads(sys.stdin.read())["workspace"]["package"]["version"])'
+          )"
+          if [[ ! "$overlay_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Could not resolve the upstream release underlying the overlay" >&2
+            exit 1
+          fi
+          overlay_base_tag="rust-v${overlay_version}"
+          upstream_tag_ref="refs/tags/${UPSTREAM_TAG}:refs/tags/${UPSTREAM_TAG}"
+          overlay_tag_ref="refs/tags/${overlay_base_tag}:refs/tags/${overlay_base_tag}"
+          if [[ "$overlay_base_tag" == "$UPSTREAM_TAG" ]]; then
+            git fetch --force --no-tags https://github.com/openai/codex.git \
+              "$upstream_tag_ref"
+          else
+            git fetch --force --no-tags https://github.com/openai/codex.git \
+              "$upstream_tag_ref" \
+              "$overlay_tag_ref"
+          fi
+          upstream_commit="$(git rev-parse "${UPSTREAM_TAG}^{commit}")"
+          overlay_base="$(git rev-parse "${overlay_base_tag}^{commit}")"
+          if ! git merge-base --is-ancestor "$overlay_base" "$source_commit"; then
+            echo "${overlay_base_tag} is not an ancestor of the overlay" >&2
+            exit 1
+          fi
+          echo "Applying overlay from ${overlay_base_tag} onto ${UPSTREAM_TAG}"
+
+          unexpected_paths="$(
+            git diff --name-only "$overlay_base" "$source_commit" |
+              grep -Ev '^(\.github/workflows/kdx-release\.yml|README\.md)$|^alias/' || true
+          )"
+          if [[ -n "$unexpected_paths" ]]; then
+            echo "Overlay changes files outside the allowed paths:" >&2
+            echo "$unexpected_paths" >&2
+            exit 1
+          fi
+
+          parent_count="$(git rev-list --parents -n 1 "$source_commit" | awk '{print NF - 1}')"
+          source_parent=""
+          if [[ "$parent_count" == "1" ]]; then
+            source_parent="$(git rev-parse "${source_commit}^")"
+          fi
+
+          if [[ "$source_parent" == "$upstream_commit" ]]; then
+            candidate_commit="$source_commit"
+          else
+            git switch --detach "$upstream_commit"
+            git diff --binary "$overlay_base" "$source_commit" | git apply --index
+            git -c user.name="github-actions[bot]" \
+              -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+              commit -m "chore: apply KDX overlay [skip ci]"
+            candidate_commit="$(git rev-parse HEAD)"
+          fi
+
+          git push --atomic origin \
+            --force-with-lease="refs/heads/main:${main_commit}" \
+            --force-with-lease="refs/heads/kdx-overlay:${overlay_commit}" \
+            "${candidate_commit}:refs/heads/main" \
+            "${candidate_commit}:refs/heads/kdx-overlay"

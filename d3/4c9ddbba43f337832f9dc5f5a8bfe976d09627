@@ -1,0 +1,16 @@
+alias/scripts/apply-alias.py
+  h_eac546b42c675a 81-108,146-156,203
+alias/scripts/test_apply_alias.py
+  h_eac546b42c675a 5-7,20,24-25,29-37,81-252
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "d34c9ddbba43f337832f9dc5f5a8bfe976d09627",
+  "prompts": {},
+  "humans": {
+    "h_eac546b42c675a": {
+      "author": "Kaijun <Kaijun@users.noreply.github.com>"
+    }
+  }
+}

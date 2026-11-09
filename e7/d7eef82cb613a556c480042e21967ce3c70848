@@ -1,0 +1,14 @@
+.github/workflows/kdx-release.yml
+  h_eac546b42c675a 297-298,302,313-322,331,338-339
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "e7d7eef82cb613a556c480042e21967ce3c70848",
+  "prompts": {},
+  "humans": {
+    "h_eac546b42c675a": {
+      "author": "Kaijun <Kaijun@users.noreply.github.com>"
+    }
+  }
+}

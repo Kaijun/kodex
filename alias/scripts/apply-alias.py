@@ -1,13 +1,10 @@
 #!/usr/bin/env python3
 """Apply a configurable runtime alias to an upstream release checkout."""
 
-from __future__ import annotations
-
 import argparse
 import json
 import re
 from pathlib import Path
-
 
 RUST_DOT_CODEX_SUFFIXES = ('"', "/", "\\", "-")
 
@@ -81,6 +78,34 @@ def rewrite_rust_source(source: str, alias: dict[str, str]) -> str:
     return source
 
 
+def rewrite_unix_install_command(source: str, alias: dict[str, str]) -> str:
+    # Support both upstream installer forms, including after env-prefix rewriting.
+    legacy_command = (
+        r"curl -fsSL https://chatgpt\.com/codex/install\.sh \| [A-Z_]+=1 sh"
+    )
+    pattern = (
+        f'"{legacy_command}"'
+        r'|r#"s=\$\(curl -fsSL https://chatgpt\.com/codex/install\.sh\)'
+        r' && [A-Z_]+=1 eval "\$s""#'
+    )
+    runtime_pattern = (
+        r'UpdateAction::StandaloneUnix\s*=>\s*\(\s*"sh",\s*&\[\s*"-c",\s*'
+        f"(?:{pattern})"
+    )
+    count = len(re.findall(runtime_pattern, source))
+    if count != 1:
+        raise RuntimeError(
+            f"expected 1 standalone Unix installer command, found {count}"
+        )
+    install_command = (
+        f"s=$(curl -fsSL https://github.com/{alias['repository']}"
+        '/releases/latest/download/install.sh) && eval "$s"'
+    )
+    # Also update matching upstream test expectations and the legacy doc comment.
+    updated = re.sub(pattern, lambda _: f'r#"{install_command}"#', source)
+    return re.sub(legacy_command, lambda _: install_command, updated)
+
+
 def apply_runtime_identity(root: Path, alias: dict[str, str]) -> None:
     binary = alias["binary_name"]
     display = alias["display_name"]
@@ -100,11 +125,6 @@ def apply_runtime_identity(root: Path, alias: dict[str, str]) -> None:
         ),
         ("linux-sandbox/Cargo.toml", "codex-linux-sandbox", f"{binary}-linux-sandbox"),
         (
-            "shell-escalation/Cargo.toml",
-            "codex-execve-wrapper",
-            f"{binary}-execve-wrapper",
-        ),
-        (
             "windows-sandbox-rs/Cargo.toml",
             "codex-windows-sandbox-setup",
             f"{binary}-windows-sandbox-setup",
@@ -120,6 +140,17 @@ def apply_runtime_identity(root: Path, alias: dict[str, str]) -> None:
             source_root / relative_path,
             f'[[bin]]\nname = "{old_name}"',
             f'[[bin]]\nname = "{new_name}"',
+            1,
+        )
+
+    # Upstream removed this crate with the patched zsh backend in October 2026.
+    # Keep older release support without making other binary targets optional.
+    legacy_manifest = source_root / "shell-escalation/Cargo.toml"
+    if legacy_manifest.exists():
+        replace_exact(
+            legacy_manifest,
+            '[[bin]]\nname = "codex-execve-wrapper"',
+            f'[[bin]]\nname = "{binary}-execve-wrapper"',
             1,
         )
 
@@ -168,17 +199,8 @@ def apply_runtime_identity(root: Path, alias: dict[str, str]) -> None:
         1,
     )
 
-    install_command = (
-        f"curl -fsSL https://github.com/{alias['repository']}/releases/latest/download/"
-        "install.sh | sh"
-    )
     action = source_root / "tui/src/update_action.rs"
-    source = action.read_text()
-    source = re.sub(
-        r"curl -fsSL https://chatgpt\.com/codex/install\.sh \| [A-Z_]+=1 sh",
-        install_command,
-        source,
-    )
+    source = rewrite_unix_install_command(action.read_text(), alias)
     old_function = (
         "pub fn get_update_action() -> Option<UpdateAction> {\n"
         "    UpdateAction::from_install_context(InstallContext::current())\n"
